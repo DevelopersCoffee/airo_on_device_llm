@@ -9,6 +9,7 @@ import com.google.ai.edge.litertlm.Conversation
 import com.google.ai.edge.litertlm.ConversationConfig
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.EngineConfig
+import com.google.ai.edge.litertlm.ExperimentalApi
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
@@ -29,6 +30,7 @@ import kotlinx.coroutines.withContext
  *
  * Carved out of the airo app's LiteRtLmPlugin (LiteRT-LM 0.18.0 API).
  */
+@OptIn(ExperimentalApi::class)
 class AiroOnDeviceLlmPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     companion object {
         private const val TAG = "AiroOnDeviceLlm"

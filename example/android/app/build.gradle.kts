@@ -6,7 +6,7 @@ plugins {
 
 android {
     namespace = "com.developerscoffee.airo_on_device_llm_example"
-    compileSdk = flutter.compileSdkVersion
+    compileSdk = maxOf(flutter.compileSdkVersion, 37)
     ndkVersion = flutter.ndkVersion
 
     compileOptions {

@@ -44,10 +44,10 @@ final store = ModelStore(
 final entry = modelCatalog.first;               // Gemma 4 E2B
 store.progress(entry).listen(print);
 await store.download(entry);
-final path = await store.installedPath(entry);  // null until complete and the size matches
+final model = await store.loadVerified(llm, entry.id); // null if missing or the hash does not match
 ```
 
-A file that fails SHA-256 verification is deleted. Apps targeting Android 14+ must declare the WorkManager foreground service type in their own manifest, as the `airo_background_downloads` README explains:
+`loadVerified` (or `verifiedPath`) hashes the file again **before every load** and compares it with the catalog's SHA-256. A file that does not match is deleted and never loaded; show the model as not ready. Hashing runs on a background isolate so the UI stays responsive, but a multi-gigabyte file still takes noticeable time; show a "checking the model" state. A download that fails SHA-256 verification is also deleted. Apps targeting Android 14+ must declare the WorkManager foreground service type in their own manifest, as the `airo_background_downloads` README explains:
 
 ```xml
 <service
@@ -62,15 +62,16 @@ A file that fails SHA-256 verification is deleted. Apps targeting Android 14+ mu
 
 | id | Size | Min RAM | SHA-256 |
 |---|---|---|---|
-| `gemma-4-e2b-it` | 2.59 GB | 3.5 GB | not yet pinned |
-| `gemma-4-e4b-it` | 3.66 GB | 5.5 GB | not yet pinned |
+| `gemma-4-e2b-it` | 2.59 GB | 3.5 GB | `181938105e0e…` |
+| `gemma-4-e4b-it` | 3.66 GB | 5.5 GB | `0b2a8980ce15…` |
 
-Entries without a SHA-256 are checked by exact size only. To pin one, read the `oid sha256:` line from `https://huggingface.co/<repo>/raw/main/<file>` and add it to `lib/src/model_catalog.dart`. A Gemma of about 1 GB or less is planned for apps that need a smaller first download.
+Every entry needs a SHA-256 and a URL pinned to a Hugging Face commit (`/resolve/<40-hex commit>/`, never `/resolve/main/`), so a file changed upstream can never be downloaded or loaded. A test fails if either is missing. To add or move an entry, read `sha` (the commit) and the file's `lfs.sha256` and `size` from `https://huggingface.co/api/models/<repo>?blobs=true`. A Gemma of about 1 GB or less is planned for apps that need a smaller first download.
 
 ## Bring your own model
 
 ```dart
-final model = await store.registerLocalModel(pickedFilePath); // copies, then checks the runtime can open it
+final own = await store.registerLocalModel(pickedFilePath); // copies, checks the runtime can open it, records its SHA-256
+final model = await store.loadVerified(llm, own.id);        // null if the file changed since
 ```
 
 Throws `InvalidModelFileError` for a non-`.litertlm` file or one the runtime cannot open, and leaves nothing behind.

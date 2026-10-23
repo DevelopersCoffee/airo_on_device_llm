@@ -1,10 +1,13 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:airo_background_downloads/airo_background_downloads.dart';
+import 'package:crypto/crypto.dart';
 
 import 'errors.dart';
 import 'model_catalog.dart';
+import 'on_device_llm.dart';
 
 /// Checks that the runtime can open a model file. Throws
 /// [InvalidModelFileError] or [UnsupportedDeviceError] when it cannot.
@@ -28,15 +31,21 @@ class InstalledModel {
 /// Keeps models in one app-private directory.
 ///
 /// Catalog models are downloaded with `airo_background_downloads`, which
-/// verifies SHA-256 when the catalog has one. A person's own model is copied
-/// in and checked by the runtime before it is accepted.
+/// verifies their SHA-256. A person's own model is copied in, checked by the
+/// runtime, and its SHA-256 recorded next to it.
+///
+/// Before any model is loaded, [verifiedPath] (or [loadVerified]) hashes the
+/// file again and compares it with the catalog or the recorded hash. A file
+/// that does not match is deleted and never loaded.
 class ModelStore {
   ModelStore({
     required this._downloads,
     required this._root,
     required this._validator,
+    this._catalog = modelCatalog,
   });
 
+  final List<ModelCatalogEntry> _catalog;
   final BackgroundDownloads _downloads;
   final Directory _root;
   final ModelValidator _validator;
@@ -102,17 +111,68 @@ class ModelStore {
     await source.copy(target.path);
     try {
       await _validator(target.path);
+      await _recordedHash(id).writeAsString(await sha256OfFile(target.path));
     } catch (_) {
       await _deleteIfExists(target);
+      await _deleteIfExists(_recordedHash(id));
       rethrow;
     }
     return InstalledModel(id: id, path: target.path, isOwn: true);
   }
 
+  File _recordedHash(String ownId) => File('${_ownDir.path}/$ownId.sha256');
+
+  /// Path of model [id] after checking its SHA-256, or `null`.
+  ///
+  /// A catalog model must match the catalog's size and SHA-256. A person's own
+  /// model must match the hash recorded when it was added; an own model added
+  /// before hashes were recorded gets its hash recorded now. A file that does
+  /// not match is deleted. Call this before every load.
+  Future<String?> verifiedPath(String id) async {
+    final entry = _entry(id);
+    if (entry != null) {
+      final file = File(_catalogPath(entry));
+      if (!await file.exists()) return null;
+      if (await file.length() != entry.sizeBytes ||
+          await sha256OfFile(file.path) != entry.sha256) {
+        await _deleteIfExists(file);
+        return null;
+      }
+      return file.path;
+    }
+    final file = File('${_ownDir.path}/$id.litertlm');
+    if (!await file.exists()) return null;
+    final actual = await sha256OfFile(file.path);
+    final recorded = _recordedHash(id);
+    if (!await recorded.exists()) {
+      await recorded.writeAsString(actual);
+      return file.path;
+    }
+    if ((await recorded.readAsString()).trim() != actual) {
+      await _deleteIfExists(file);
+      await _deleteIfExists(recorded);
+      return null;
+    }
+    return file.path;
+  }
+
+  /// Loads model [id] with [llm] only if [verifiedPath] accepts it. Returns
+  /// `null`, without calling the runtime, when the file is missing or does not
+  /// match its hash; the app should then show the model as not ready.
+  Future<LoadedModel?> loadVerified(
+    OnDeviceLlm llm,
+    String id, {
+    LlmBackend backend = LlmBackend.cpu,
+  }) async {
+    final path = await verifiedPath(id);
+    if (path == null) return null;
+    return llm.load(path, backend: backend);
+  }
+
   /// Every usable model in the store.
   Future<List<InstalledModel>> installed() async {
     final models = <InstalledModel>[];
-    for (final entry in modelCatalog) {
+    for (final entry in _catalog) {
       final path = await installedPath(entry);
       if (path != null) {
         models.add(InstalledModel(id: entry.id, path: path, isOwn: false));
@@ -137,15 +197,30 @@ class ModelStore {
 
   /// Removes a model by id, downloaded or own.
   Future<void> delete(String id) async {
-    final entry = catalogEntry(id);
+    final entry = _entry(id);
     if (entry != null) {
       await _deleteIfExists(File(_catalogPath(entry)));
       return;
     }
     await _deleteIfExists(File('${_ownDir.path}/$id.litertlm'));
+    await _deleteIfExists(_recordedHash(id));
+  }
+
+  ModelCatalogEntry? _entry(String id) {
+    for (final entry in _catalog) {
+      if (entry.id == id) return entry;
+    }
+    return null;
   }
 
   Future<void> _deleteIfExists(File file) async {
     if (await file.exists()) await file.delete();
   }
 }
+
+/// SHA-256 of the file at [path] in lowercase hex, computed on a background
+/// isolate so a multi-gigabyte model does not block the UI.
+Future<String> sha256OfFile(String path) => Isolate.run(() async {
+  final digest = await sha256.bind(File(path).openRead()).first;
+  return digest.toString();
+});

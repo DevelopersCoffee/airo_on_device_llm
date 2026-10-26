@@ -1,3 +1,10 @@
+## 0.3.0
+
+- A full SHA-256 check that passes leaves a `<model>.verified` stamp with the hash, size and modification time. Later checks trust the stamp while the size and modification time are unchanged, and hash again otherwise. On a Pixel 9 this takes a Gemma 4 E2B reload from 51 s to 0.6 s.
+- `registerLocalModel` stamps the copy it hashed, so a person's own model is not hashed twice.
+- Deleting or cancelling a model also removes its stamp.
+- `ModelStore` takes an optional `hasher` for tests.
+
 ## 0.2.0
 
 - Catalog URLs are pinned to a Hugging Face commit, and every entry has a SHA-256 (`ModelCatalogEntry.sha256` is now required).

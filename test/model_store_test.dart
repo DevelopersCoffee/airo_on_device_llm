@@ -40,12 +40,17 @@ void main() {
   late FakeDownloads downloads;
   final validated = <String>[];
   var rejectValidation = false;
+  var hashes = 0;
 
   ModelStore store({List<ModelCatalogEntry> catalog = modelCatalog}) =>
       ModelStore(
         downloads: downloads,
         root: root,
         catalog: catalog,
+        hasher: (path) {
+          hashes++;
+          return sha256OfFile(path);
+        },
         validator: (path) async {
           validated.add(path);
           if (rejectValidation) {
@@ -59,6 +64,7 @@ void main() {
     downloads = FakeDownloads();
     validated.clear();
     rejectValidation = false;
+    hashes = 0;
   });
 
   tearDown(() => root.delete(recursive: true));
@@ -133,6 +139,55 @@ void main() {
         expect(platform.loaded, isEmpty);
       },
     );
+
+    test('a verified file is not hashed again while unchanged', () async {
+      final file = File('${root.path}/${entry.fileName}')
+        ..writeAsBytesSync(good);
+      final s = store(catalog: [entry]);
+      expect(await s.verifiedPath(entry.id), file.path);
+      expect(hashes, 1);
+      expect(File('${file.path}.verified').existsSync(), isTrue);
+      expect(await s.verifiedPath(entry.id), file.path);
+      expect(await store(catalog: [entry]).verifiedPath(entry.id), file.path);
+      expect(hashes, 1);
+    });
+
+    test('a file changed after its stamp is hashed again', () async {
+      final file = File('${root.path}/${entry.fileName}')
+        ..writeAsBytesSync(good);
+      expect(await store(catalog: [entry]).verifiedPath(entry.id), file.path);
+      // Same size, different bytes, new modification time.
+      file
+        ..writeAsBytesSync([9, 9, 9, 9])
+        ..setLastModifiedSync(DateTime.now().add(const Duration(seconds: 5)));
+      expect(await store(catalog: [entry]).loadVerified(llm, entry.id), isNull);
+      expect(hashes, 2);
+      expect(file.existsSync(), isFalse);
+      expect(File('${file.path}.verified').existsSync(), isFalse);
+      expect(platform.loaded, isEmpty);
+    });
+
+    test('a stamp for a different hash is not trusted', () async {
+      final file = File('${root.path}/${entry.fileName}')
+        ..writeAsBytesSync([9, 9, 9, 9]);
+      final stat = file.statSync();
+      // Right size and time, but stamped for another hash.
+      File('${file.path}.verified').writeAsStringSync(
+        '${'0' * 64} ${stat.size} ${stat.modified.microsecondsSinceEpoch}',
+      );
+      expect(await store(catalog: [entry]).verifiedPath(entry.id), isNull);
+      expect(hashes, 1);
+      expect(file.existsSync(), isFalse);
+      expect(File('${file.path}.verified').existsSync(), isFalse);
+    });
+
+    test('a registered own model loads without a second hash', () async {
+      final source = File('${root.path}/mine.litertlm')..writeAsBytesSync(good);
+      final own = await store().registerLocalModel(source.path);
+      expect(hashes, 1);
+      expect(await store().loadVerified(llm, own.id), isNotNull);
+      expect(hashes, 1);
+    });
 
     test('a missing file is not loaded', () async {
       expect(await store(catalog: [entry]).loadVerified(llm, entry.id), isNull);

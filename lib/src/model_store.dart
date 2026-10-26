@@ -34,21 +34,29 @@ class InstalledModel {
 /// verifies their SHA-256. A person's own model is copied in, checked by the
 /// runtime, and its SHA-256 recorded next to it.
 ///
-/// Before any model is loaded, [verifiedPath] (or [loadVerified]) hashes the
-/// file again and compares it with the catalog or the recorded hash. A file
-/// that does not match is deleted and never loaded.
+/// Before any model is loaded, [verifiedPath] (or [loadVerified]) checks the
+/// file against the catalog or the recorded hash. A file that does not match
+/// is deleted and never loaded.
+///
+/// Hashing a multi-gigabyte model takes close to a minute on a phone, so a
+/// full hash that passes leaves a stamp next to the file with the hash, the
+/// size and the modification time. A later check that finds the same size
+/// and modification time trusts the stamp instead of hashing again. Any write
+/// to the file changes its modification time, so it is hashed again.
 class ModelStore {
   ModelStore({
     required this._downloads,
     required this._root,
     required this._validator,
     this._catalog = modelCatalog,
-  });
+    Future<String> Function(String path) hasher = sha256OfFile,
+  }) : _hash = hasher;
 
   final List<ModelCatalogEntry> _catalog;
   final BackgroundDownloads _downloads;
   final Directory _root;
   final ModelValidator _validator;
+  final Future<String> Function(String path) _hash;
 
   Directory get _ownDir => Directory('${_root.path}/own');
 
@@ -77,7 +85,7 @@ class ModelStore {
       .where((event) => event.artifactId == entry.id)
       .asyncMap((event) async {
         if (event.failure?.code == DownloadFailureCode.integrityMismatch) {
-          await _deleteIfExists(File(_catalogPath(entry)));
+          await _deleteModelFile(File(_catalogPath(entry)));
         }
         return event;
       });
@@ -85,7 +93,7 @@ class ModelStore {
   /// Stops the download of [entry] and removes the partial file.
   Future<void> cancel(ModelCatalogEntry entry) async {
     await _downloads.cancel(entry.id);
-    await _deleteIfExists(File(_catalogPath(entry)));
+    await _deleteModelFile(File(_catalogPath(entry)));
   }
 
   /// Path of [entry] when it is fully downloaded, else `null`.
@@ -111,9 +119,12 @@ class ModelStore {
     await source.copy(target.path);
     try {
       await _validator(target.path);
-      await _recordedHash(id).writeAsString(await sha256OfFile(target.path));
+      final before = await target.stat();
+      final sha = await _hash(target.path);
+      await _recordedHash(id).writeAsString(sha);
+      await _stamp(target).writeAsString(_stampFor(sha, before));
     } catch (_) {
-      await _deleteIfExists(target);
+      await _deleteModelFile(target);
       await _deleteIfExists(_recordedHash(id));
       rethrow;
     }
@@ -121,6 +132,31 @@ class ModelStore {
   }
 
   File _recordedHash(String ownId) => File('${_ownDir.path}/$ownId.sha256');
+
+  File _stamp(File model) => File('${model.path}.verified');
+
+  String _stampFor(String sha, FileStat stat) =>
+      '$sha ${stat.size} ${stat.modified.microsecondsSinceEpoch}';
+
+  /// Whether [model] still matches [sha]: from its stamp when the size and
+  /// modification time are unchanged, otherwise by hashing it. A full hash
+  /// that matches writes a new stamp.
+  Future<bool> _matches(File model, String sha) async {
+    final stamp = _stamp(model);
+    final before = await model.stat();
+    if (await stamp.exists() &&
+        (await stamp.readAsString()).trim() == _stampFor(sha, before)) {
+      return true;
+    }
+    await _deleteIfExists(stamp);
+    if (await _hash(model.path) != sha) return false;
+    // Stamp only if nothing wrote to the file while it was being hashed.
+    final after = await model.stat();
+    if (after.size == before.size && after.modified == before.modified) {
+      await stamp.writeAsString(_stampFor(sha, after));
+    }
+    return true;
+  }
 
   /// Path of model [id] after checking its SHA-256, or `null`.
   ///
@@ -134,22 +170,21 @@ class ModelStore {
       final file = File(_catalogPath(entry));
       if (!await file.exists()) return null;
       if (await file.length() != entry.sizeBytes ||
-          await sha256OfFile(file.path) != entry.sha256) {
-        await _deleteIfExists(file);
+          !await _matches(file, entry.sha256)) {
+        await _deleteModelFile(file);
         return null;
       }
       return file.path;
     }
     final file = File('${_ownDir.path}/$id.litertlm');
     if (!await file.exists()) return null;
-    final actual = await sha256OfFile(file.path);
     final recorded = _recordedHash(id);
     if (!await recorded.exists()) {
-      await recorded.writeAsString(actual);
+      await recorded.writeAsString(await _hash(file.path));
       return file.path;
     }
-    if ((await recorded.readAsString()).trim() != actual) {
-      await _deleteIfExists(file);
+    if (!await _matches(file, (await recorded.readAsString()).trim())) {
+      await _deleteModelFile(file);
       await _deleteIfExists(recorded);
       return null;
     }
@@ -199,10 +234,12 @@ class ModelStore {
   Future<void> delete(String id) async {
     final entry = _entry(id);
     if (entry != null) {
-      await _deleteIfExists(File(_catalogPath(entry)));
+      final file = File(_catalogPath(entry));
+      await _deleteModelFile(file);
       return;
     }
-    await _deleteIfExists(File('${_ownDir.path}/$id.litertlm'));
+    final file = File('${_ownDir.path}/$id.litertlm');
+    await _deleteModelFile(file);
     await _deleteIfExists(_recordedHash(id));
   }
 
@@ -211,6 +248,12 @@ class ModelStore {
       if (entry.id == id) return entry;
     }
     return null;
+  }
+
+  /// Deletes a model file and its stamp.
+  Future<void> _deleteModelFile(File file) async {
+    await _deleteIfExists(file);
+    await _deleteIfExists(_stamp(file));
   }
 
   Future<void> _deleteIfExists(File file) async {
